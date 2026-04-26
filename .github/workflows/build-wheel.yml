@@ -22,18 +22,20 @@ jobs:
 
       - name: Install Build Requirements
         run: |
-          python3.11 -m pip install -r requirements-build.txt
+          python3.11 -m pip install --no-cache-dir cmake ninja packaging "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" wheel jinja2
+          python3.11 -m pip install --no-cache-dir "torch==2.10.0" --index-url https://download.pytorch.org/whl/cu124
+          python3.11 -m pip install --no-cache-dir build
 
       - name: Build Wheel
         env:
           MAX_JOBS: 2 
           TORCH_CUDA_ARCH_LIST: "8.0 8.9 9.0" 
         run: |
-          python3.11 setup.py bdist_wheel
+          python3.11 -m build --wheel --no-isolation
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vllm-custom-wheel-cp311
+          name: vllm-confident-wheel-cp311
           path: dist/*.whl
           retention-days: 7
