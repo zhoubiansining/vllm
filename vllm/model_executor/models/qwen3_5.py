@@ -24,16 +24,20 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
+import math
 import typing
 from collections.abc import Callable, Iterable
+from itertools import islice
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
@@ -442,6 +446,128 @@ class Qwen3_5Model(Qwen3NextModel):
         return loaded_params
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
+class Qwen3_5TroughModel(Qwen3_5Model):
+    """Inner model that, in addition to the main forward, collects the raw
+    (pre-norm) ``(hidden_states, residual)`` of each candidate layer into a
+    Python list ``trough_states`` and returns it alongside ``hidden_states``.
+    This mirrors the existing ``aux_hidden_states`` return pattern, which is
+    already known to be Dynamo / CUDA-graph safe.
+
+    Normalisation is intentionally NOT done inside the compiled forward; the
+    eager wrapper (``Qwen3_5ForCausalLMBase.forward``) consumes the returned
+    list and applies ``self.norm`` per layer.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        additional_config = getattr(vllm_config, "additional_config", {}) or {}
+        hf_overrides = getattr(vllm_config.model_config, "hf_overrides", {}) or {}
+
+        def _cfg(key: str, default: object) -> object:
+            if key in additional_config:
+                return additional_config[key]
+            if isinstance(hf_overrides, dict) and key in hf_overrides:
+                return hf_overrides[key]
+            return default
+
+        num_layers = self.end_layer - self.start_layer
+        max_backtrack = int(_cfg("trough_max_backtrack_layers", 0))
+        backtrack_ratio = float(_cfg("trough_backtrack_ratio", 0.0))
+
+        if max_backtrack > 0:
+            candidate_layers = min(num_layers, max_backtrack)
+        elif backtrack_ratio > 0:
+            candidate_layers = max(1, int(math.ceil(num_layers * backtrack_ratio)))
+        else:
+            candidate_layers = num_layers
+
+        self._trough_candidate_layers: int = candidate_layers
+        self._trough_start_layer: int = self.start_layer + (
+            num_layers - candidate_layers
+        )
+
+        # Fixed max seq_len — kept for config compatibility but no longer used
+        # for buffer allocation (trough states are now collected in a list).
+        self._trough_max_seq_len: int = int(
+            _cfg("trough_max_seq_len", 2048)
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> (
+        torch.Tensor
+        | IntermediateTensors
+        | tuple[torch.Tensor]
+        | tuple[torch.Tensor, list]
+        | tuple[torch.Tensor, list, list]
+    ):
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+
+        aux_hidden_states: list[torch.Tensor] = []
+        trough_states: list[torch.Tensor] = []
+
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            if layer_idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+
+            if layer_idx >= self._trough_start_layer:
+                # Collect (hidden, residual) tuples — same pattern as aux_hidden_states,
+                # which is already Dynamo/CUDA-graph safe.
+                # IMPORTANT: clone here. vLLM decoder layers commonly do in-place
+                # fused add+rmsnorm on the `residual` tensor passed in to the
+                # NEXT layer, which would silently mutate any plain reference we
+                # stored. aux_hidden_states avoids this because it stores
+                # `hidden + residual` (a fresh tensor); we must do the same by
+                # cloning.
+                current_h = hidden_states + residual if residual is not None else hidden_states
+                trough_states.append(current_h)
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+
+        # Match the existing aux_hidden_states return pattern exactly.
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states, trough_states
+        return hidden_states, trough_states
+
+
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
@@ -478,9 +604,35 @@ class Qwen3_5ForCausalLMBase(
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
-        self.model = Qwen3_5Model(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+
+        additional_config = getattr(vllm_config, "additional_config", {}) or {}
+        hf_overrides = getattr(vllm_config.model_config, "hf_overrides", {}) or {}
+
+        def _cfg_get(key: str, default: object) -> object:
+            if key in additional_config:
+                return additional_config[key]
+            if isinstance(hf_overrides, dict) and key in hf_overrides:
+                return hf_overrides[key]
+            return default
+
+        self.enable_trough_decoding = bool(
+            _cfg_get("enable_multi_layer_entropy_selection", False)
         )
+        if self.enable_trough_decoding and get_pp_group().world_size > 1:
+            logger.warning(
+                "Disabling trough decoding because pipeline parallelism is enabled; "
+                "current implementation only supports PP=1 for correctness."
+            )
+            self.enable_trough_decoding = False
+
+        if self.enable_trough_decoding:
+            self.model = Qwen3_5TroughModel(
+                vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            )
+        else:
+            self.model = Qwen3_5Model(
+                vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            )
 
         # When LoRA is enabled, GDN uses separate in_proj_qkv and in_proj_z
         # instead of merged in_proj_qkvz; pack mapping must match.
@@ -508,6 +660,36 @@ class Qwen3_5ForCausalLMBase(
             self.model.make_empty_intermediate_tensors
         )
 
+        self.trough_max_backtrack_layers = int(
+            _cfg_get("trough_max_backtrack_layers", 0)
+        )
+        self.trough_backtrack_ratio = float(_cfg_get("trough_backtrack_ratio", 0.0))
+        self.trough_select_method = str(_cfg_get("select_method", "trough"))
+        self.trough_p = float(_cfg_get("p", 1.0))
+
+        self.trough_log_interval = int(_cfg_get("trough_log_interval", 0))
+        self._trough_call_count = 0
+
+        self._trough_buffers = {}
+        self._last_eager_buf = None
+        self._last_seq_len = 0
+
+        logger.info(
+            "Qwen3.5 trough decoding init: enabled=%s, "
+            "select_method=%s, p=%.2f, "
+            "max_backtrack_layers=%d, backtrack_ratio=%.3f, trough_log_interval=%d, "
+            "additional_config_keys=%s",
+            self.enable_trough_decoding,
+            self.trough_select_method,
+            self.trough_p,
+            self.trough_max_backtrack_layers,
+            self.trough_backtrack_ratio,
+            self.trough_log_interval,
+            sorted(additional_config.keys())
+            if isinstance(additional_config, dict)
+            else str(type(additional_config)),
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
@@ -526,17 +708,265 @@ class Qwen3_5ForCausalLMBase(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
-        hidden_states = self.model(
+        is_trough_model = isinstance(self.model, Qwen3_5TroughModel)
+
+        output = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
 
-        return hidden_states
+        if not self.enable_trough_decoding:
+            return output
+
+        if get_pp_group().is_last_rank:
+            assert is_trough_model
+
+            # Unpack based on tuple length returned by TroughModel.forward.
+            if isinstance(output, tuple) and len(output) == 3:
+                hidden_states, aux_hidden_states, trough_states = output
+            else:
+                hidden_states, trough_states = output
+                aux_hidden_states = None
+
+            if not trough_states:
+                if aux_hidden_states:
+                    return hidden_states, aux_hidden_states
+                return hidden_states
+
+            # Apply norm to each (hidden, residual) pair collected in trough_states.
+            normed_layers = []
+            for hs in trough_states:
+                normed = self.model.norm(hs, None)
+                normed_layers.append(normed)
+            self._last_eager_buf = (
+                torch.stack(normed_layers) if normed_layers else None
+            )
+            self._trough_buffers[hidden_states.shape[0]] = self._last_eager_buf
+
+            if aux_hidden_states:
+                return hidden_states, aux_hidden_states
+            return hidden_states
+        return output
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        self._trough_call_count += 1
+        B = hidden_states.shape[0]
+
+        if not self.enable_trough_decoding:
+            self._last_logits_indices = None
+            self._last_eager_buf = None
+            self._trough_buffers = {}
+            return self.logits_processor(self.lm_head, hidden_states)
+
+        assert isinstance(self.model, Qwen3_5TroughModel)
+        layer_states = self._trough_buffers.get(self._last_seq_len, self._last_eager_buf)
+
+        if layer_states is None:
+            return self.logits_processor(self.lm_head, hidden_states)
+        L_buf, S_buf, H_buf = layer_states.shape
+
+        logits_indices = getattr(self, "_last_logits_indices", None)
+        if logits_indices is not None:
+            layer_states = layer_states[:, logits_indices]
+        elif B != S_buf:
+            layer_states = layer_states[:, -B:]
+
+        selected_logits = self._vectorized_entropy_select(
+            layer_states, hidden_states
+        )
+        # Consume-once semantics: clear sideband state after use so a
+        # subsequent call (e.g. prompt-logprobs) cannot inherit stale
+        # indices from this round.
+        self._last_logits_indices = None
+        self._last_seq_len = 0
+        return selected_logits
+
+    def _vectorized_entropy_select(
+        self,
+        layer_states: torch.Tensor,
+        fallback_hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Layer selection for entropy-trough (and related) decoding.
+
+        Supported ``select_method`` values:
+
+        ===================  ================================================
+        Method               Behaviour
+        ===================  ================================================
+        ``trough``           First entropy valley from the back (default).
+                             Scans ``[min_layer, L-1]`` and freezes each token's
+                             choice at the first layer where entropy stops
+                             strictly decreasing.  ``min_layer`` is bounded by
+                             ``trough_max_backtrack_layers`` and/or
+                             ``trough_backtrack_ratio``.
+        ``trough-m1``        Like ``trough`` but shift selection by -1 (toward
+                             shallower layers), clamped to ``[0, L-1]``.
+        ``trough-m2``        Like ``trough`` but shift selection by -2.
+        ``trough-p1``        Like ``trough`` but shift selection by +1 (toward
+                             deeper layers), clamped to ``[0, L-1]``.
+        ``trough-p2``        Like ``trough`` but shift selection by +2.
+        ``last-m1``          No entropy scan; always select layer ``L-1-1``.
+        ``last-m2``          Always select layer ``L-1-2``.
+        ``last-m4``          Always select layer ``L-1-4``.
+        ``last-m8``          Always select layer ``L-1-8``.
+        ===================  ================================================
+
+        ``p`` controls stochastic fallback to the final layer (standard decoding):
+        with probability ``1-p`` the final layer's logits are used regardless of
+        the selected method.
+
+        Args:
+            layer_states: ``[L, B, H]`` – normed hidden states for each
+                candidate layer (written by ``Qwen3_5TroughModel.forward``).
+            fallback_hidden_states: ``[B, H]`` – last-layer hidden states
+                used as fallback if the lm_head is unavailable.
+
+        Returns:
+            ``[B, V]`` logits selected per-token from the chosen layer.
+        """
+        L, B, H = layer_states.shape
+        device = layer_states.device
+
+        flat = layer_states.reshape(L * B, H)
+        flat_logits = self.logits_processor(self.lm_head, flat)
+        if flat_logits is None:
+            logger.warning("[trough-decoding] step=%d: No logits available for trough selection", self._trough_call_count)
+            return self.logits_processor(self.lm_head, fallback_hidden_states)
+        V = flat_logits.shape[-1]
+        all_logits = flat_logits.reshape(L, B, V)
+
+        method = self.trough_select_method
+
+        # Model-level constants: total_model_layers and the model-layer index
+        # corresponding to candidate index 0.  These are needed for "last-mk"
+        # which selects by absolute model layer, not candidate index.
+        assert isinstance(self.model, Qwen3_5TroughModel)
+        total_model_layers = len(self.model.layers)
+        trough_start_layer = self.model._trough_start_layer
+        # Model-layer index of candidate index L-1 (the last candidate layer)
+        trough_last_model_layer = trough_start_layer + L - 1
+
+        # ── "last-*" methods: no entropy scan needed ──────────────────────
+        if method.startswith("last-"):
+            try:
+                offset = int(method.split("-m")[-1])
+            except (IndexError, ValueError):
+                offset = 0
+            # "last-mk" means model layer (total_model_layers - 1 - k)
+            target_model_layer = max(0, total_model_layers - 1 - offset)
+            # Convert model-layer index to candidate index; clamp to buffer range
+            cand_idx = target_model_layer - trough_start_layer
+            cand_idx = max(0, min(L - 1, cand_idx))
+            selected_layer_idx = torch.full(
+                (B,), cand_idx, device=device, dtype=torch.long
+            )
+        else:
+            # ── Entropy computation ──────────────────────────────────────────
+            probs = F.softmax(all_logits.float(), dim=-1)
+            entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
+
+            # Determine scan window
+            explicit = int(self.trough_max_backtrack_layers)
+            if explicit > 0:
+                max_backtrack = explicit
+            elif explicit < 0:
+                max_backtrack = L
+            else:
+                max_backtrack = int(L * self.trough_backtrack_ratio)
+            min_layer = L - 1 - max(0, max_backtrack)
+
+            # ── Scan from back to find first valley ─────────────────────────
+            selected_layer_idx = torch.full(
+                (B,), L - 1, device=device, dtype=torch.long
+            )
+            frozen = torch.zeros(B, dtype=torch.bool, device=device)
+            prev_entropy = entropy[L - 1]
+
+            for l_idx in range(L - 2, min_layer - 1, -1):
+                cur_entropy = entropy[l_idx]
+                improves = cur_entropy < prev_entropy
+                update_mask = improves & (~frozen)
+                selected_layer_idx = torch.where(
+                    update_mask,
+                    torch.full_like(selected_layer_idx, l_idx),
+                    selected_layer_idx,
+                )
+                frozen = frozen | (~improves)
+                prev_entropy = cur_entropy
+
+            # ── Apply trough shift ─────────────────────────────────────────
+            # For trough variants, shift is in candidate-index space.
+            if method == "trough-m2":
+                selected_layer_idx = torch.clamp(selected_layer_idx - 2, 0, L - 1)
+            elif method == "trough-m1":
+                selected_layer_idx = torch.clamp(selected_layer_idx - 1, 0, L - 1)
+            elif method == "trough-p1":
+                selected_layer_idx = torch.clamp(selected_layer_idx + 1, 0, L - 1)
+            elif method == "trough-p2":
+                selected_layer_idx = torch.clamp(selected_layer_idx + 2, 0, L - 1)
+            # ``trough`` needs no shift
+
+        # ── Stochastic fallback to final layer ─────────────────────────────
+        p = float(self.trough_p)
+        if p < 1.0:
+            rng = torch.rand(B, device=device)
+            use_final = rng > p
+            selected_layer_idx = torch.where(
+                use_final,
+                torch.full((B,), L - 1, device=device, dtype=torch.long),
+                selected_layer_idx,
+            )
+
+        # ── Gather selected logits ─────────────────────────────────────────
+        gather_idx = selected_layer_idx.unsqueeze(0).unsqueeze(-1).expand(1, B, V)
+        selected_logits = all_logits.gather(0, gather_idx).squeeze(0)
+
+        # Degenerate batch: nothing to log, nothing to select.
+        if B == 0:
+            return selected_logits
+
+        # ── Selective logging ─────────────────────────────────────────────
+        if self.trough_log_interval > 0 and (
+            self._trough_call_count % self.trough_log_interval == 0
+        ):
+            with torch.no_grad():
+                sel = selected_layer_idx
+                backtrack_depth = (L - 1) - sel
+                num_at_final = (sel == (L - 1)).sum().item()
+                preview = min(B, 4)
+                if method.startswith("trough"):
+                    final_entropy = entropy[L - 1]
+                    sample_pairs = [
+                        (int(sel[i].item()), float(final_entropy[i].item()))
+                        for i in range(preview)
+                    ]
+                else:
+                    sample_pairs = [
+                        (int(sel[i].item()), 0.0) for i in range(preview)
+                    ]
+                logger.info(
+                    "[trough-decoding] step=%d tokens=%d layers=%d "
+                    "select_method=%s p=%.2f "
+                    "avg_selected_layer=%.2f min_selected_layer=%d "
+                    "avg_backtrack_depth=%.2f max_backtrack_depth=%d "
+                    "tokens_kept_at_final=%d/%d sample=%s",
+                    self._trough_call_count,
+                    B,
+                    L,
+                    method,
+                    p,
+                    sel.float().mean().item(),
+                    int(sel.min().item()),
+                    backtrack_depth.float().mean().item(),
+                    int(backtrack_depth.max().item()),
+                    num_at_final,
+                    B,
+                    sample_pairs,
+                )
+
+        return selected_logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
@@ -688,14 +1118,38 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         if intermediate_tensors is not None:
             inputs_embeds = None
 
-        hidden_states = self.language_model.model(
+        # IMPORTANT: call language_model.forward instead of language_model.model.
+        # This ensures feature hooks in Qwen3_5ForCausalLMBase.forward
+        # (e.g. trough hidden-state capture) are executed.
+        output = self.language_model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+        return output
 
-        return hidden_states
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        # Forward the logits_indices attribute set by the model_runner to the
+        # language model so that trough decoding can slice its buffer without
+        # reconstructing indices.
+        idx = getattr(self, "_last_logits_indices", None)
+        if idx is not None:
+            self.language_model._last_logits_indices = idx
+        # Forward _last_seq_len so the wrapper can key into _trough_buffers
+        # to find the correct CUDA-graph-recorded buffer for this batch shape.
+        seq_len = getattr(self, "_last_seq_len", None)
+        if seq_len is not None:
+            self.language_model._last_seq_len = seq_len
+
+        try:
+            return self.language_model.compute_logits(hidden_states)
+        finally:
+            self._last_logits_indices = None
+            self._last_seq_len = None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

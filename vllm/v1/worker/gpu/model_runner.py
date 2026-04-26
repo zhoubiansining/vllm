@@ -491,6 +491,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         num_reqs = hidden_states.shape[0]
+        actual_model = self.get_model()
+        actual_model._last_logits_indices = None
+        actual_model._last_seq_len = hidden_states.shape[0]
         logits = self.model.compute_logits(hidden_states)
         dummy_input_batch = InputBatch.make_dummy(
             num_reqs, num_reqs, self.input_buffers
@@ -832,7 +835,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        # Must be set in the runner (eager scope), not in model.forward
+        # where the assignment would be ignored on graph replay.
+        actual_model = self.get_model()
+        actual_model._last_seq_len = hidden_states.shape[0]
         sample_hidden_states = hidden_states[input_batch.logits_indices]
+        # Expose logits_indices via a side-band attribute so algorithms
+        # (e.g. Qwen3.5 entropy-trough decoding) can slice intermediate
+        # buffers aligned with the full (pre-slicing) hidden_states.
+        # Ignored by models that do not use it.
+        actual_model._last_logits_indices = input_batch.logits_indices
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -1074,8 +1086,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
-            if self.use_aux_hidden_state_outputs:
-                assert isinstance(model_output, tuple)
+            if isinstance(model_output, tuple) and len(model_output) == 2:
                 hidden_states, aux_hidden_states = model_output
             else:
                 assert isinstance(model_output, torch.Tensor)

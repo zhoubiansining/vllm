@@ -1309,7 +1309,10 @@ class Gemma4ForConditionalGeneration(
             else None
         )
 
-        hidden_states = self.language_model.model(
+        # IMPORTANT: call language_model.forward instead of language_model.model.
+        # This ensures feature hooks in Gemma4ForCausalLM.forward
+        # (e.g. trough hidden-state capture) are executed.
+        output = self.language_model(
             input_ids,
             positions,
             per_layer_inputs=per_layer_inputs,
@@ -1318,12 +1321,20 @@ class Gemma4ForConditionalGeneration(
             **kwargs,
         )
 
-        return hidden_states
+        return output
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        # Forward _last_logits_indices and _last_seq_len so the language model
+        # can key into _trough_buffers correctly.
+        idx = getattr(self, "_last_logits_indices", None)
+        if idx is not None:
+            self.language_model._last_logits_indices = idx
+        seq_len = getattr(self, "_last_seq_len", None)
+        if seq_len is not None:
+            self.language_model._last_seq_len = seq_len
         return self.language_model.compute_logits(hidden_states)
 
     # ------------------------------------------------------------------ #

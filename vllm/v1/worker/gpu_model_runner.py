@@ -1687,6 +1687,11 @@ class GPUModelRunner(
             # No requests in common with the previous iteration
             # So input_ids.cpu will have all the input ids.
             return
+        # Also guard against an empty prev_sampled_token_ids (can happen when
+        # the batch is scheduled but prev_sampled_token_ids has not been
+        # populated yet on a non-zero rank or after a re-schedule edge case).
+        if self.input_batch.prev_sampled_token_ids.shape[0] == 0:
+            return
         if common_indices_match and max_flattened_index == (num_common_tokens - 1):
             # Common-case optimization: the batch is unchanged
             # and no reordering happened.
@@ -1698,6 +1703,11 @@ class GPUModelRunner(
             )
             if self.enable_prompt_embeds:
                 self.is_token_ids.gpu[:num_common_tokens] = True
+            return
+        # Guard against empty scatter (can occur when common_requests is
+        # non-empty but the flattened indices are empty due to schedule edge
+        # cases).
+        if not sample_flattened_indices:
             return
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
         sampled_tokens_index_tensor = torch.tensor(
@@ -1719,6 +1729,8 @@ class GPUModelRunner(
             return
 
         assert isinstance(self._draft_token_ids, torch.Tensor)
+        if not prev_draft_token_indices:
+            return
         draft_tokens_index_tensor = torch.tensor(
             spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
         ).to(self.device, non_blocking=True)
@@ -4040,11 +4052,9 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
+            if isinstance(model_output, tuple) and len(model_output) == 2:
                 hidden_states, aux_hidden_states = model_output
             else:
-                # Common case.
                 hidden_states = model_output
                 aux_hidden_states = None
 
@@ -4066,11 +4076,28 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
+                # Set _last_seq_len so trough-decoding can pick the correct
+                # CUDA-graph-recorded buffer keyed by the captured token count.
+                # Must be set in the runner (eager scope), not in model.forward
+                # where the assignment would be ignored on graph replay.
+                actual_model = self.get_model()
+                actual_model._last_seq_len = hidden_states.shape[0]
+
                 sample_hidden_states = hidden_states[logits_indices]
+                # Expose logits_indices to the model so that algorithms which
+                # need to slice intermediate buffers aligned with the full
+                # (pre-slicing) hidden_states (e.g. Qwen3.5 entropy-trough
+                # decoding) can do so without reconstructing indices.  This
+                # attribute is purely optional and ignored by models that
+                # do not use it.
+                actual_model._last_logits_indices = logits_indices
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
+                actual_model = self.get_model()
+                if get_pp_group().is_last_rank:
+                    actual_model._last_seq_len = hidden_states.shape[0]
 
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
@@ -4086,6 +4113,7 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
+                    actual_model._last_logits_indices = logits_indices
                     logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
@@ -5059,7 +5087,10 @@ class GPUModelRunner(
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
+            actual_model = self.get_model()
+            actual_model._last_seq_len = hidden_states.shape[0]
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
+            actual_model._last_logits_indices = None
             logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
@@ -5479,7 +5510,7 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
 
-            if self.use_aux_hidden_state_outputs:
+            if isinstance(outputs, tuple) and len(outputs) == 2:
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
@@ -5568,6 +5599,9 @@ class GPUModelRunner(
 
         hidden_states = torch.rand_like(hidden_states)
 
+        actual_model = self.get_model()
+        actual_model._last_logits_indices = None
+        actual_model._last_seq_len = hidden_states.shape[0]
         logits = self.model.compute_logits(hidden_states)
         num_reqs = logits.size(0)
 

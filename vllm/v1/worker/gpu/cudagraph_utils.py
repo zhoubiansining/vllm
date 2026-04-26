@@ -345,21 +345,28 @@ class ModelCudaGraphManager(CudaGraphManager):
 
                 if cg_mode == CUDAGraphMode.PIECEWISE:
                     # PW CUDA graph internally handles the model outputs.
-                    # No need to keep track of the hidden states.
                     return None
 
                 if self.is_last_pp_rank:
-                    # Last PP rank (common case).
-                    if self.use_aux_hidden_state_outputs:
-                        hidden_states, aux_hidden_states = model_output
+                    # The model forward writes trough hidden states into its
+                    # internal _trough_layer_buf as a side-effect; no need to
+                    # extract it from the return value here.
+                    if isinstance(model_output, tuple) and len(model_output) == 2:
+                        hidden_states, aux_out = model_output
+                        if isinstance(aux_out, torch.Tensor):
+                            # trough case: second element was stripped, aux is None
+                            aux_hidden_states = []
+                        else:
+                            # aux hidden-states case
+                            aux_hidden_states = list(aux_out) if aux_out else []
                     else:
                         hidden_states = model_output
                         aux_hidden_states = []
                     if self.hidden_states is None:
                         self.hidden_states = torch.empty_like(hidden_states)
                     self.hidden_states[:num_tokens] = hidden_states
-                    if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
-                        self.aux_hidden_states = [
+                    if self.use_aux_hidden_state_outputs and not aux_hidden_states:
+                        aux_hidden_states = [
                             torch.empty_like(x) for x in aux_hidden_states
                         ]
                     for i, aux in enumerate(aux_hidden_states):
