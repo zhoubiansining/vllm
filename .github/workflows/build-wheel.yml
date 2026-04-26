@@ -1,0 +1,39 @@
+name: Build Custom vLLM Wheel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04 
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies & Python 3.11
+        run: |
+          apt-get update
+          apt-get install -y python3.11 python3.11-dev python3.11-venv git curl build-essential ninja-build
+          curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
+          python3.11 -m pip install --upgrade pip setuptools wheel build ninja
+
+      - name: Install Build Requirements
+        run: |
+          python3.11 -m pip install -r requirements-build.txt
+
+      - name: Build Wheel
+        env:
+          MAX_JOBS: 2 
+          TORCH_CUDA_ARCH_LIST: "8.0 8.9 9.0" 
+        run: |
+          python3.11 setup.py bdist_wheel
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-custom-wheel-cp311
+          path: dist/*.whl
+          retention-days: 7
