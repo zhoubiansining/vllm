@@ -7,7 +7,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: nvidia/cuda:12.4.1-devel-ubuntu22.04 
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04 
 
     steps:
       - name: Checkout code
@@ -18,12 +18,14 @@ jobs:
           apt-get update
           apt-get install -y python3.11 python3.11-dev python3.11-venv git curl build-essential ninja-build
           curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
-          python3.11 -m pip install --upgrade pip setuptools wheel build ninja
+          python3.11 -m pip install --upgrade --no-cache-dir pip setuptools wheel build ninja
 
       - name: Install Build Requirements
         run: |
           python3.11 -m pip install --no-cache-dir cmake ninja packaging "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" wheel jinja2
-          python3.11 -m pip install --no-cache-dir "torch==2.10.0" --index-url https://download.pytorch.org/whl/cu124
+
+          python3.11 -m pip install --no-cache-dir "torch==2.10.0" --index-url https://download.pytorch.org/whl/cu128
+          
           python3.11 -m pip install --no-cache-dir build
 
       - name: Build Wheel
@@ -36,6 +38,6 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vllm-confident-wheel-cp311
+          name: vllm-custom-wheel-cp311
           path: dist/*.whl
           retention-days: 7
