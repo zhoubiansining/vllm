@@ -34,6 +34,7 @@ jobs:
         env:
           MAX_JOBS: 2 
           TORCH_CUDA_ARCH_LIST: "8.0 8.9 9.0" 
+          SETUPTOOLS_SCM_PRETEND_VERSION: "0.19.1+confident"
         run: |
           python3.11 -m build --wheel --no-isolation
 
