@@ -12,6 +12,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install System Dependencies & Python 3.11
         run: |
@@ -22,7 +24,7 @@ jobs:
 
       - name: Install Build Requirements
         run: |
-          python3.11 -m pip install --no-cache-dir cmake ninja packaging "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" wheel jinja2
+          python3.11 -m pip install --no-cache-dir cmake ninja packaging "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" wheel jinja2 numpy
 
           python3.11 -m pip install --no-cache-dir "torch==2.10.0" --index-url https://download.pytorch.org/whl/cu128
           
