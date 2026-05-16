@@ -18,6 +18,7 @@
 from collections.abc import Iterable
 from itertools import islice
 
+import math
 import torch
 from torch import nn
 from transformers import Gemma3TextConfig
@@ -449,6 +450,86 @@ class Gemma3Model(nn.Module):
         return loaded_params
 
 
+# =============================================================================
+# Gemma3TroughModel — inner model with pre-allocated trough buffer
+# =============================================================================
+
+
+class _Gemma3TroughModelImpl(Gemma3Model):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        additional_config = getattr(vllm_config, "additional_config", {}) or {}
+        hf_overrides = getattr(vllm_config.model_config, "hf_overrides", {}) or {}
+
+        def _cfg(key: str, default: object) -> object:
+            if key in additional_config:
+                return additional_config[key]
+            if isinstance(hf_overrides, dict) and key in hf_overrides:
+                return hf_overrides[key]
+            return default
+
+        num_layers = self.end_layer - self.start_layer
+        max_backtrack = int(_cfg("trough_max_backtrack_layers", 0))
+        backtrack_ratio = float(_cfg("trough_backtrack_ratio", 0.0))
+
+        if max_backtrack > 0:
+            candidate_layers = min(num_layers, max_backtrack)
+        elif backtrack_ratio > 0:
+            candidate_layers = max(1, int(math.ceil(num_layers * backtrack_ratio)))
+        else:
+            candidate_layers = num_layers
+
+        self._trough_candidate_layers: int = candidate_layers
+        self._trough_start_layer: int = self.start_layer + (
+            num_layers - candidate_layers
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor | IntermediateTensors:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+        trough_states: list[torch.Tensor] = []
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                residual,
+                **kwargs,
+            )
+            if layer_idx >= self._trough_start_layer:
+                current_h = hidden_states + residual if residual is not None else hidden_states
+                trough_states.append(current_h)
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states, trough_states
+
+
+@support_torch_compile
+class Gemma3TroughModel(_Gemma3TroughModelImpl):
+    pass
+
+
 class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -469,9 +550,35 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = Gemma3Model(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+
+        additional_config = getattr(vllm_config, "additional_config", {}) or {}
+        hf_overrides = getattr(vllm_config.model_config, "hf_overrides", {}) or {}
+
+        def _cfg_get(key: str, default: object) -> object:
+            if key in additional_config:
+                return additional_config[key]
+            if isinstance(hf_overrides, dict) and key in hf_overrides:
+                return hf_overrides[key]
+            return default
+
+        self.enable_trough_decoding = bool(
+            _cfg_get("enable_multi_layer_entropy_selection", False)
         )
+        if self.enable_trough_decoding and get_pp_group().world_size > 1:
+            logger.warning(
+                "Disabling trough decoding because pipeline parallelism is enabled; "
+                "current implementation only supports PP=1 for correctness."
+            )
+            self.enable_trough_decoding = False
+
+        if self.enable_trough_decoding:
+            self.model = Gemma3TroughModel(
+                vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            )
+        else:
+            self.model = Gemma3Model(
+                vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            )
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -489,6 +596,31 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self.model.make_empty_intermediate_tensors
         )
 
+        self.trough_max_backtrack_layers = int(
+            _cfg_get("trough_max_backtrack_layers", 0)
+        )
+        self.trough_backtrack_ratio = float(_cfg_get("trough_backtrack_ratio", 0.0))
+        self.trough_select_method = str(_cfg_get("select_method", "trough"))
+        self.trough_p = float(_cfg_get("p", 1.0))
+        self.trough_log_interval = int(_cfg_get("trough_log_interval", 0))
+        self._trough_call_count = 0
+        self._trough_buffers: dict = {}
+        self._last_eager_buf = None
+        self._last_seq_len = 0
+
+        if self.enable_trough_decoding:
+            logger.info(
+                "Gemma3 trough decoding init: enabled=%s, "
+                "select_method=%s, p=%.2f, "
+                "max_backtrack_layers=%d, backtrack_ratio=%.3f, trough_log_interval=%d",
+                self.enable_trough_decoding,
+                self.trough_select_method,
+                self.trough_p,
+                self.trough_max_backtrack_layers,
+                self.trough_backtrack_ratio,
+                self.trough_log_interval,
+            )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
@@ -500,17 +632,67 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.model(
+        is_trough_model = isinstance(self.model, Gemma3TroughModel)
+
+        output = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
+
+        if not (self.enable_trough_decoding and is_trough_model and get_pp_group().is_last_rank):
+            return output
+
+        if isinstance(output, tuple) and len(output) == 2:
+            hidden_states, trough_states = output
+        else:
+            return output
+        if not trough_states:
+            return hidden_states
+
+        normed_layers = [self.model.norm(hs, None) for hs in trough_states]
+        self._last_eager_buf = torch.stack(normed_layers) if normed_layers else None
+        self._trough_buffers[hidden_states.shape[0]] = self._last_eager_buf
         return hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits
+        if not self.enable_trough_decoding:
+            return self.logits_processor(self.lm_head, hidden_states)
+
+        from .trough_utils import vectorized_entropy_select
+
+        self._trough_call_count += 1
+        B = hidden_states.shape[0]
+        assert isinstance(self.model, Gemma3TroughModel)
+        layer_states = self._trough_buffers.get(self._last_seq_len, self._last_eager_buf)
+        if layer_states is None:
+            return self.logits_processor(self.lm_head, hidden_states)
+        L_buf, S_buf, H_buf = layer_states.shape
+
+        logits_indices = getattr(self, "_last_logits_indices", None)
+        if logits_indices is not None:
+            layer_states = layer_states[:, logits_indices]
+        elif B != S_buf:
+            layer_states = layer_states[:, -B:]
+
+        selected_logits, _, _, _ = vectorized_entropy_select(
+            layer_states=layer_states,
+            fallback_hidden_states=hidden_states,
+            logits_processor=self.logits_processor,
+            lm_head=self.lm_head,
+            select_method=self.trough_select_method,
+            trough_p=self.trough_p,
+            trough_max_backtrack_layers=self.trough_max_backtrack_layers,
+            trough_backtrack_ratio=self.trough_backtrack_ratio,
+            trough_start_layer=self.model._trough_start_layer,
+            total_model_layers=len(self.model.layers),
+            trough_log_interval=self.trough_log_interval,
+            trough_call_count=self._trough_call_count,
+        )
+        self._last_logits_indices = None
+        self._last_seq_len = 0
+        return selected_logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

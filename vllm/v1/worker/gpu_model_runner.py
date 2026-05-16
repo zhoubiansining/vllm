@@ -4081,22 +4081,20 @@ class GPUModelRunner(
                 # Must be set in the runner (eager scope), not in model.forward
                 # where the assignment would be ignored on graph replay.
                 actual_model = self.get_model()
-                actual_model._last_seq_len = hidden_states.shape[0]
+                if getattr(actual_model, "enable_trough_decoding", False):
+                    actual_model._last_seq_len = hidden_states.shape[0]
+                    actual_model._last_logits_indices = logits_indices
 
                 sample_hidden_states = hidden_states[logits_indices]
-                # Expose logits_indices to the model so that algorithms which
-                # need to slice intermediate buffers aligned with the full
-                # (pre-slicing) hidden_states (e.g. Qwen3.5 entropy-trough
-                # decoding) can do so without reconstructing indices.  This
-                # attribute is purely optional and ignored by models that
-                # do not use it.
-                actual_model._last_logits_indices = logits_indices
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
                 actual_model = self.get_model()
-                if get_pp_group().is_last_rank:
+                trough_enabled = getattr(
+                    actual_model, "enable_trough_decoding", False
+                )
+                if trough_enabled and get_pp_group().is_last_rank:
                     actual_model._last_seq_len = hidden_states.shape[0]
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -4113,7 +4111,8 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
-                    actual_model._last_logits_indices = logits_indices
+                    if trough_enabled:
+                        actual_model._last_logits_indices = logits_indices
                     logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
@@ -5088,9 +5087,10 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             actual_model = self.get_model()
-            actual_model._last_seq_len = hidden_states.shape[0]
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            actual_model._last_logits_indices = None
+            if getattr(actual_model, "enable_trough_decoding", False):
+                actual_model._last_seq_len = hidden_states.shape[0]
+                actual_model._last_logits_indices = None
             logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
@@ -5600,8 +5600,9 @@ class GPUModelRunner(
         hidden_states = torch.rand_like(hidden_states)
 
         actual_model = self.get_model()
-        actual_model._last_logits_indices = None
-        actual_model._last_seq_len = hidden_states.shape[0]
+        if getattr(actual_model, "enable_trough_decoding", False):
+            actual_model._last_logits_indices = None
+            actual_model._last_seq_len = hidden_states.shape[0]
         logits = self.model.compute_logits(hidden_states)
         num_reqs = logits.size(0)
 

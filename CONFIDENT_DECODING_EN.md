@@ -137,13 +137,57 @@ Always select the ninth-to-last layer:
 
 ## Supported Models
 
-The current implementation supports the following model paths:
+The current implementation supports the following model paths (grouped by family).
 
-- Qwen3.5: `model_executor/models/qwen3_5.py`, including `Qwen3_5ForCausalLM` and `Qwen3_5ForConditionalGeneration`.
-- Qwen3.5 MoE: reuses the Qwen3.5 CausalLMBase implementation.
-- GPT-OSS: `model_executor/models/gpt_oss.py`.
-- Gemma4: `model_executor/models/gemma4.py`, with the multimodal entry point in `model_executor/models/gemma4_mm.py` forwarding to the language-model wrapper.
-- GLM5.1 / DeepSeek-V2 family: `model_executor/models/deepseek_v2.py`.
+**Entry point notation:**
+- `ForCausalLM` = standard causal language model entry point (text-only)
+- `ForConditionalGeneration` = multimodal entry point that forwards to the language model wrapper
+
+### Llama Family
+- Llama: `model_executor/models/llama.py` (`LlamaForCausalLM`)
+- Llama4: `model_executor/models/llama4.py` (`Llama4ForCausalLM`)
+- Mistral: `model_executor/models/mistral.py` (`MistralForCausalLM`, inherits from LlamaForCausalLM)
+- Mixtral: `model_executor/models/mixtral.py` (`MixtralForCausalLM`)
+
+### Qwen Family
+- Qwen2: `model_executor/models/qwen2.py` (`Qwen2ForCausalLM`)
+- Qwen3: `model_executor/models/qwen3.py` (`Qwen3ForCausalLM`)
+- Qwen2 MoE: `model_executor/models/qwen2_moe.py` (`Qwen2MoeForCausalLM`)
+- Qwen3 MoE: `model_executor/models/qwen3_moe.py` (`Qwen3MoeForCausalLM`)
+- Qwen3 Next: `model_executor/models/qwen3_next.py` (`Qwen3NextForCausalLM`)
+- Qwen3.5: `model_executor/models/qwen3_5.py`, includes both `Qwen3_5ForCausalLM` and `Qwen3_5ForConditionalGeneration` (multimodal)
+
+### Gemma Family
+- Gemma2: `model_executor/models/gemma2.py` (`Gemma2ForCausalLM`)
+- Gemma3: `model_executor/models/gemma3.py` (`Gemma3ForCausalLM`), multimodal entry `model_executor/models/gemma3_mm.py` (`Gemma3ForConditionalGeneration`)
+- Gemma4: `model_executor/models/gemma4.py` (`Gemma4ForCausalLM`), multimodal entry in `model_executor/models/gemma4_mm.py` (`Gemma4ForConditionalGeneration`)
+
+### DeepSeek / GLM Family
+- GLM5.1 / DeepSeek-V2 family: `model_executor/models/deepseek_v2.py` (`DeepseekV2ForCausalLM`)
+
+### OpenAI-Compatible Family
+- GPT-OSS: `model_executor/models/gpt_oss.py` (`GPTOSSForCausalLM`)
+
+### Multimodal Entry Points: Support Status
+
+For multimodal models, the language model wrapper (`*ForCausalLM`) carries the trough decoding logic. Whether the multimodal `*ForConditionalGeneration` wrapper exposes trough decoding depends on whether it dispatches through `language_model.forward` (which runs the trough hook) or directly through `language_model.model` (which bypasses it).
+
+**Multimodal entry points that DO support trough decoding:**
+- `Qwen3_5ForConditionalGeneration` (`qwen3_5.py`)
+- `Gemma4ForConditionalGeneration` (`gemma4_mm.py`)
+- `Qwen2VLForConditionalGeneration` (`qwen2_vl.py`)
+- `Qwen2_5VLForConditionalGeneration` (`qwen2_5_vl.py`)
+- `Gemma3ForConditionalGeneration` (`gemma3_mm.py`)
+- `Mistral3ForConditionalGeneration` (`mistral3.py`)
+- `Llama4ForConditionalGeneration` / `Llama4MultiModal` (`mllama4.py`)
+
+All supported wrappers follow the same pattern: call `self.language_model(...)` in `forward` (instead of `self.language_model.model(...)`), expose an `enable_trough_decoding` property, and forward `_last_logits_indices` / `_last_seq_len` to the language model in `compute_logits` before delegating.
+
+**Multimodal entry points that DO NOT currently support trough decoding (kept unchanged):**
+- `Qwen3VLForConditionalGeneration` (`qwen3_vl.py`) — uses a dedicated `Qwen3LLMForCausalLM` subclass that bypasses the parent's trough `__init__` (`super(Qwen3ForCausalLM, self).__init__()`); also uses deepstack, which requires additional integration.
+- `Qwen3VLMoeForConditionalGeneration` (`qwen3_vl_moe.py`) — same constraint as Qwen3-VL.
+
+For these unsupported multimodal entry points, enabling trough via `--additional-config` falls back to standard final-layer decoding for the multimodal entry. The standalone text-only `Qwen3ForCausalLM` / `Qwen3MoeForCausalLM` still supports trough decoding.
 
 ## Logging and Validation
 

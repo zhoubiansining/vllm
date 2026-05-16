@@ -1323,18 +1323,23 @@ class Gemma4ForConditionalGeneration(
 
         return output
 
+    @property
+    def enable_trough_decoding(self) -> bool:
+        return getattr(self.language_model, "enable_trough_decoding", False)
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         # Forward _last_logits_indices and _last_seq_len so the language model
         # can key into _trough_buffers correctly.
-        idx = getattr(self, "_last_logits_indices", None)
-        if idx is not None:
-            self.language_model._last_logits_indices = idx
-        seq_len = getattr(self, "_last_seq_len", None)
-        if seq_len is not None:
-            self.language_model._last_seq_len = seq_len
+        if getattr(self.language_model, "enable_trough_decoding", False):
+            idx = getattr(self, "_last_logits_indices", None)
+            if idx is not None:
+                self.language_model._last_logits_indices = idx
+            seq_len = getattr(self, "_last_seq_len", None)
+            if seq_len is not None:
+                self.language_model._last_seq_len = seq_len
         return self.language_model.compute_logits(hidden_states)
 
     # ------------------------------------------------------------------ #

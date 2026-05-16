@@ -137,13 +137,57 @@ vllm serve /workspace/ckpt/Qwen3.5-9B \
 
 ## 支持模型
 
-当前已接入以下模型路径：
+当前已接入以下模型路径（按系列分组）。
 
-- Qwen3.5：`model_executor/models/qwen3_5.py`，入口包括 `Qwen3_5ForCausalLM` 和 `Qwen3_5ForConditionalGeneration`。
-- Qwen3.5 MoE：复用 Qwen3.5 CausalLMBase 逻辑。
-- GPT-OSS：`model_executor/models/gpt_oss.py`。
-- Gemma4：`model_executor/models/gemma4.py`，多模态入口在 `model_executor/models/gemma4_mm.py` 中转发到语言模型 wrapper。
-- GLM5.1 / DeepSeek-V2 系：`model_executor/models/deepseek_v2.py`。
+**入口说明：**
+- `ForCausalLM` = 标准因果语言模型入口（纯文本）
+- `ForConditionalGeneration` = 多模态入口，透传到语言模型 wrapper
+
+### Llama 系列
+- Llama：`model_executor/models/llama.py` (`LlamaForCausalLM`)
+- Llama4：`model_executor/models/llama4.py` (`Llama4ForCausalLM`)
+- Mistral：`model_executor/models/mistral.py` (`MistralForCausalLM`，继承自 LlamaForCausalLM)
+- Mixtral：`model_executor/models/mixtral.py` (`MixtralForCausalLM`)
+
+### Qwen 系列
+- Qwen2：`model_executor/models/qwen2.py` (`Qwen2ForCausalLM`)
+- Qwen3：`model_executor/models/qwen3.py` (`Qwen3ForCausalLM`)
+- Qwen2 MoE：`model_executor/models/qwen2_moe.py` (`Qwen2MoeForCausalLM`)
+- Qwen3 MoE：`model_executor/models/qwen3_moe.py` (`Qwen3MoeForCausalLM`)
+- Qwen3 Next：`model_executor/models/qwen3_next.py` (`Qwen3NextForCausalLM`)
+- Qwen3.5：`model_executor/models/qwen3_5.py`，入口包括 `Qwen3_5ForCausalLM` 和 `Qwen3_5ForConditionalGeneration`（多模态）
+
+### Gemma 系列
+- Gemma2：`model_executor/models/gemma2.py` (`Gemma2ForCausalLM`)
+- Gemma3：`model_executor/models/gemma3.py` (`Gemma3ForCausalLM`)，多模态入口 `model_executor/models/gemma3_mm.py` (`Gemma3ForConditionalGeneration`)
+- Gemma4：`model_executor/models/gemma4.py` (`Gemma4ForCausalLM`)，多模态入口 `model_executor/models/gemma4_mm.py` (`Gemma4ForConditionalGeneration`)
+
+### DeepSeek / GLM 系列
+- GLM5.1 / DeepSeek-V2 系：`model_executor/models/deepseek_v2.py` (`DeepseekV2ForCausalLM`)
+
+### OpenAI 兼容系列
+- GPT-OSS：`model_executor/models/gpt_oss.py` (`GPTOSSForCausalLM`)
+
+### 多模态入口：支持情况
+
+对于多模态模型，trough decoding 逻辑承载在语言模型 wrapper (`*ForCausalLM`) 中。多模态 `*ForConditionalGeneration` wrapper 是否能透传 trough decoding，取决于其内部调用的是 `language_model.forward`（会触发 trough 钩子）还是直接调用 `language_model.model`（绕过 trough 钩子）。
+
+**支持 trough decoding 的多模态入口：**
+- `Qwen3_5ForConditionalGeneration` (`qwen3_5.py`)
+- `Gemma4ForConditionalGeneration` (`gemma4_mm.py`)
+- `Qwen2VLForConditionalGeneration` (`qwen2_vl.py`)
+- `Qwen2_5VLForConditionalGeneration` (`qwen2_5_vl.py`)
+- `Gemma3ForConditionalGeneration` (`gemma3_mm.py`)
+- `Mistral3ForConditionalGeneration` (`mistral3.py`)
+- `Llama4ForConditionalGeneration` / `Llama4MultiModal` (`mllama4.py`)
+
+所有支持的 wrapper 遵循同一模式：在 `forward` 中调用 `self.language_model(...)`（而非 `self.language_model.model(...)`），暴露 `enable_trough_decoding` property，并在 `compute_logits` 中将 `_last_logits_indices` / `_last_seq_len` 转发给语言模型再委托。
+
+**当前不支持 trough decoding 的多模态入口（保持原始代码不变）：**
+- `Qwen3VLForConditionalGeneration` (`qwen3_vl.py`) —— 使用专用的 `Qwen3LLMForCausalLM` 子类，通过 `super(Qwen3ForCausalLM, self).__init__()` 绕过父类的 trough `__init__`；同时使用 deepstack，需要额外集成工作。
+- `Qwen3VLMoeForConditionalGeneration` (`qwen3_vl_moe.py`) —— 与 Qwen3-VL 相同约束。
+
+对于以上不支持的多模态入口，通过 `--additional-config` 启用 trough 时，多模态入口会回退到标准最终层 decoding。对应语言族的纯文本 `Qwen3ForCausalLM` / `Qwen3MoeForCausalLM` 入口仍支持 trough decoding。
 
 ## 日志与验证
 

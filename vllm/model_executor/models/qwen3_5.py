@@ -674,21 +674,22 @@ class Qwen3_5ForCausalLMBase(
         self._last_eager_buf = None
         self._last_seq_len = 0
 
-        logger.info(
-            "Qwen3.5 trough decoding init: enabled=%s, "
-            "select_method=%s, p=%.2f, "
-            "max_backtrack_layers=%d, backtrack_ratio=%.3f, trough_log_interval=%d, "
-            "additional_config_keys=%s",
-            self.enable_trough_decoding,
-            self.trough_select_method,
-            self.trough_p,
-            self.trough_max_backtrack_layers,
-            self.trough_backtrack_ratio,
-            self.trough_log_interval,
-            sorted(additional_config.keys())
-            if isinstance(additional_config, dict)
-            else str(type(additional_config)),
-        )
+        if self.enable_trough_decoding:
+            logger.info(
+                "Qwen3.5 trough decoding init: enabled=%s, "
+                "select_method=%s, p=%.2f, "
+                "max_backtrack_layers=%d, backtrack_ratio=%.3f, trough_log_interval=%d, "
+                "additional_config_keys=%s",
+                self.enable_trough_decoding,
+                self.trough_select_method,
+                self.trough_p,
+                self.trough_max_backtrack_layers,
+                self.trough_backtrack_ratio,
+                self.trough_log_interval,
+                sorted(additional_config.keys())
+                if isinstance(additional_config, dict)
+                else str(type(additional_config)),
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -751,18 +752,15 @@ class Qwen3_5ForCausalLMBase(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        self._trough_call_count += 1
-        B = hidden_states.shape[0]
-
         if not self.enable_trough_decoding:
-            self._last_logits_indices = None
-            self._last_eager_buf = None
-            self._trough_buffers = {}
             return self.logits_processor(self.lm_head, hidden_states)
 
+        from .trough_utils import vectorized_entropy_select
+
+        self._trough_call_count += 1
+        B = hidden_states.shape[0]
         assert isinstance(self.model, Qwen3_5TroughModel)
         layer_states = self._trough_buffers.get(self._last_seq_len, self._last_eager_buf)
-
         if layer_states is None:
             return self.logits_processor(self.lm_head, hidden_states)
         L_buf, S_buf, H_buf = layer_states.shape
@@ -773,199 +771,22 @@ class Qwen3_5ForCausalLMBase(
         elif B != S_buf:
             layer_states = layer_states[:, -B:]
 
-        selected_logits = self._vectorized_entropy_select(
-            layer_states, hidden_states
+        selected_logits, _, _, _ = vectorized_entropy_select(
+            layer_states=layer_states,
+            fallback_hidden_states=hidden_states,
+            logits_processor=self.logits_processor,
+            lm_head=self.lm_head,
+            select_method=self.trough_select_method,
+            trough_p=self.trough_p,
+            trough_max_backtrack_layers=self.trough_max_backtrack_layers,
+            trough_backtrack_ratio=self.trough_backtrack_ratio,
+            trough_start_layer=self.model._trough_start_layer,
+            total_model_layers=len(self.model.layers),
+            trough_log_interval=self.trough_log_interval,
+            trough_call_count=self._trough_call_count,
         )
-        # Consume-once semantics: clear sideband state after use so a
-        # subsequent call (e.g. prompt-logprobs) cannot inherit stale
-        # indices from this round.
         self._last_logits_indices = None
         self._last_seq_len = 0
-        return selected_logits
-
-    def _vectorized_entropy_select(
-        self,
-        layer_states: torch.Tensor,
-        fallback_hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        """Layer selection for entropy-trough (and related) decoding.
-
-        Supported ``select_method`` values:
-
-        ===================  ================================================
-        Method               Behaviour
-        ===================  ================================================
-        ``trough``           First entropy valley from the back (default).
-                             Scans ``[min_layer, L-1]`` and freezes each token's
-                             choice at the first layer where entropy stops
-                             strictly decreasing.  ``min_layer`` is bounded by
-                             ``trough_max_backtrack_layers`` and/or
-                             ``trough_backtrack_ratio``.
-        ``trough-m1``        Like ``trough`` but shift selection by -1 (toward
-                             shallower layers), clamped to ``[0, L-1]``.
-        ``trough-m2``        Like ``trough`` but shift selection by -2.
-        ``trough-p1``        Like ``trough`` but shift selection by +1 (toward
-                             deeper layers), clamped to ``[0, L-1]``.
-        ``trough-p2``        Like ``trough`` but shift selection by +2.
-        ``last-m1``          No entropy scan; always select layer ``L-1-1``.
-        ``last-m2``          Always select layer ``L-1-2``.
-        ``last-m4``          Always select layer ``L-1-4``.
-        ``last-m8``          Always select layer ``L-1-8``.
-        ===================  ================================================
-
-        ``p`` controls stochastic fallback to the final layer (standard decoding):
-        with probability ``1-p`` the final layer's logits are used regardless of
-        the selected method.
-
-        Args:
-            layer_states: ``[L, B, H]`` – normed hidden states for each
-                candidate layer (written by ``Qwen3_5TroughModel.forward``).
-            fallback_hidden_states: ``[B, H]`` – last-layer hidden states
-                used as fallback if the lm_head is unavailable.
-
-        Returns:
-            ``[B, V]`` logits selected per-token from the chosen layer.
-        """
-        L, B, H = layer_states.shape
-        device = layer_states.device
-
-        flat = layer_states.reshape(L * B, H)
-        flat_logits = self.logits_processor(self.lm_head, flat)
-        if flat_logits is None:
-            logger.warning("[trough-decoding] step=%d: No logits available for trough selection", self._trough_call_count)
-            return self.logits_processor(self.lm_head, fallback_hidden_states)
-        V = flat_logits.shape[-1]
-        all_logits = flat_logits.reshape(L, B, V)
-
-        method = self.trough_select_method
-
-        # Model-level constants: total_model_layers and the model-layer index
-        # corresponding to candidate index 0.  These are needed for "last-mk"
-        # which selects by absolute model layer, not candidate index.
-        assert isinstance(self.model, Qwen3_5TroughModel)
-        total_model_layers = len(self.model.layers)
-        trough_start_layer = self.model._trough_start_layer
-        # Model-layer index of candidate index L-1 (the last candidate layer)
-        trough_last_model_layer = trough_start_layer + L - 1
-
-        # ── "last-*" methods: no entropy scan needed ──────────────────────
-        if method.startswith("last-"):
-            try:
-                offset = int(method.split("-m")[-1])
-            except (IndexError, ValueError):
-                offset = 0
-            # "last-mk" means model layer (total_model_layers - 1 - k)
-            target_model_layer = max(0, total_model_layers - 1 - offset)
-            # Convert model-layer index to candidate index; clamp to buffer range
-            cand_idx = target_model_layer - trough_start_layer
-            cand_idx = max(0, min(L - 1, cand_idx))
-            selected_layer_idx = torch.full(
-                (B,), cand_idx, device=device, dtype=torch.long
-            )
-        else:
-            # ── Entropy computation ──────────────────────────────────────────
-            probs = F.softmax(all_logits.float(), dim=-1)
-            entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
-
-            # Determine scan window
-            explicit = int(self.trough_max_backtrack_layers)
-            if explicit > 0:
-                max_backtrack = explicit
-            elif explicit < 0:
-                max_backtrack = L
-            else:
-                max_backtrack = int(L * self.trough_backtrack_ratio)
-            min_layer = L - 1 - max(0, max_backtrack)
-
-            # ── Scan from back to find first valley ─────────────────────────
-            selected_layer_idx = torch.full(
-                (B,), L - 1, device=device, dtype=torch.long
-            )
-            frozen = torch.zeros(B, dtype=torch.bool, device=device)
-            prev_entropy = entropy[L - 1]
-
-            for l_idx in range(L - 2, min_layer - 1, -1):
-                cur_entropy = entropy[l_idx]
-                improves = cur_entropy < prev_entropy
-                update_mask = improves & (~frozen)
-                selected_layer_idx = torch.where(
-                    update_mask,
-                    torch.full_like(selected_layer_idx, l_idx),
-                    selected_layer_idx,
-                )
-                frozen = frozen | (~improves)
-                prev_entropy = cur_entropy
-
-            # ── Apply trough shift ─────────────────────────────────────────
-            # For trough variants, shift is in candidate-index space.
-            if method == "trough-m2":
-                selected_layer_idx = torch.clamp(selected_layer_idx - 2, 0, L - 1)
-            elif method == "trough-m1":
-                selected_layer_idx = torch.clamp(selected_layer_idx - 1, 0, L - 1)
-            elif method == "trough-p1":
-                selected_layer_idx = torch.clamp(selected_layer_idx + 1, 0, L - 1)
-            elif method == "trough-p2":
-                selected_layer_idx = torch.clamp(selected_layer_idx + 2, 0, L - 1)
-            # ``trough`` needs no shift
-
-        # ── Stochastic fallback to final layer ─────────────────────────────
-        p = float(self.trough_p)
-        if p < 1.0:
-            rng = torch.rand(B, device=device)
-            use_final = rng > p
-            selected_layer_idx = torch.where(
-                use_final,
-                torch.full((B,), L - 1, device=device, dtype=torch.long),
-                selected_layer_idx,
-            )
-
-        # ── Gather selected logits ─────────────────────────────────────────
-        gather_idx = selected_layer_idx.unsqueeze(0).unsqueeze(-1).expand(1, B, V)
-        selected_logits = all_logits.gather(0, gather_idx).squeeze(0)
-
-        # Degenerate batch: nothing to log, nothing to select.
-        if B == 0:
-            return selected_logits
-
-        # ── Selective logging ─────────────────────────────────────────────
-        if self.trough_log_interval > 0 and (
-            self._trough_call_count % self.trough_log_interval == 0
-        ):
-            with torch.no_grad():
-                sel = selected_layer_idx
-                backtrack_depth = (L - 1) - sel
-                num_at_final = (sel == (L - 1)).sum().item()
-                preview = min(B, 4)
-                if method.startswith("trough"):
-                    final_entropy = entropy[L - 1]
-                    sample_pairs = [
-                        (int(sel[i].item()), float(final_entropy[i].item()))
-                        for i in range(preview)
-                    ]
-                else:
-                    sample_pairs = [
-                        (int(sel[i].item()), 0.0) for i in range(preview)
-                    ]
-                logger.info(
-                    "[trough-decoding] step=%d tokens=%d layers=%d "
-                    "select_method=%s p=%.2f "
-                    "avg_selected_layer=%.2f min_selected_layer=%d "
-                    "avg_backtrack_depth=%.2f max_backtrack_depth=%d "
-                    "tokens_kept_at_final=%d/%d sample=%s",
-                    self._trough_call_count,
-                    B,
-                    L,
-                    method,
-                    p,
-                    sel.float().mean().item(),
-                    int(sel.min().item()),
-                    backtrack_depth.float().mean().item(),
-                    int(backtrack_depth.max().item()),
-                    num_at_final,
-                    B,
-                    sample_pairs,
-                )
-
         return selected_logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1129,6 +950,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         )
         return output
 
+    @property
+    def enable_trough_decoding(self) -> bool:
+        return getattr(self.language_model, "enable_trough_decoding", False)
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -1136,14 +961,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         # Forward the logits_indices attribute set by the model_runner to the
         # language model so that trough decoding can slice its buffer without
         # reconstructing indices.
-        idx = getattr(self, "_last_logits_indices", None)
-        if idx is not None:
-            self.language_model._last_logits_indices = idx
-        # Forward _last_seq_len so the wrapper can key into _trough_buffers
-        # to find the correct CUDA-graph-recorded buffer for this batch shape.
-        seq_len = getattr(self, "_last_seq_len", None)
-        if seq_len is not None:
-            self.language_model._last_seq_len = seq_len
+        if getattr(self.language_model, "enable_trough_decoding", False):
+            idx = getattr(self, "_last_logits_indices", None)
+            if idx is not None:
+                self.language_model._last_logits_indices = idx
+            seq_len = getattr(self, "_last_seq_len", None)
+            if seq_len is not None:
+                self.language_model._last_seq_len = seq_len
 
         try:
             return self.language_model.compute_logits(hidden_states)

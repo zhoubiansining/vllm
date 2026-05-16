@@ -54,7 +54,15 @@ from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
-from .llama import LlamaForCausalLM, LlamaMLP, LlamaModel
+from .llama import (
+    LlamaForCausalLM,
+    LlamaMLP,
+    LlamaModel,
+    LlamaTroughModel,
+    _LlamaTroughModelImpl,
+    llama_model_invariants,
+)
+from .interfaces import EagleModelMixin
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -385,6 +393,32 @@ class Llama4DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.feed_forward(hidden_states)
         return hidden_states, residual
+
+
+@support_torch_compile(
+    shape_invariants=llama_model_invariants
+)
+class Llama4TroughModel(_LlamaTroughModelImpl, EagleModelMixin):
+    """Llama4 inner model for trough (entropy-based layer selection).
+
+    Combines trough hidden-state collection from _LlamaTroughModelImpl
+    with Llama4-specific MoE weight loading via load_weights override.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(
+            vllm_config=vllm_config,
+            prefix=prefix,
+            layer_type=Llama4DecoderLayer,
+        )
+        # Llama4Model.__init__ sets these for MoE expert weight loading.
+        self.num_experts = vllm_config.model_config.hf_config.num_local_experts
+        self.n_redundant_experts = (
+            vllm_config.parallel_config.eplb_config.num_redundant_experts
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return Llama4Model.load_weights(self, weights)
 
 
 @support_torch_compile
@@ -808,6 +842,8 @@ class Llama4ForCausalLM(LlamaForCausalLM, MixtureOfExperts):
         prefix: str = "",
         layer_type: type[Llama4DecoderLayer] = Llama4DecoderLayer,
     ):
+        if self.enable_trough_decoding:
+            return Llama4TroughModel(vllm_config=vllm_config, prefix=prefix)
         return Llama4Model(
             vllm_config=vllm_config, prefix=prefix, layer_type=layer_type
         )

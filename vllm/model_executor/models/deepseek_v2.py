@@ -1497,21 +1497,22 @@ class DeepseekV2ForCausalLM(
         self._last_eager_buf = None
         self._last_seq_len = 0
 
-        logger.info(
-            "DeepseekV2 trough decoding init: enabled=%s, "
-            "select_method=%s, p=%.2f, "
-            "max_backtrack_layers=%d, backtrack_ratio=%.3f, trough_log_interval=%d, "
-            "additional_config_keys=%s",
-            self.enable_trough_decoding,
-            self.trough_select_method,
-            self.trough_p,
-            self.trough_max_backtrack_layers,
-            self.trough_backtrack_ratio,
-            self.trough_log_interval,
-            sorted(additional_config.keys())
-            if isinstance(additional_config, dict)
-            else str(type(additional_config)),
-        )
+        if self.enable_trough_decoding:
+            logger.info(
+                "DeepseekV2 trough decoding init: enabled=%s, "
+                "select_method=%s, p=%.2f, "
+                "max_backtrack_layers=%d, backtrack_ratio=%.3f, trough_log_interval=%d, "
+                "additional_config_keys=%s",
+                self.enable_trough_decoding,
+                self.trough_select_method,
+                self.trough_p,
+                self.trough_max_backtrack_layers,
+                self.trough_backtrack_ratio,
+                self.trough_log_interval,
+                sorted(additional_config.keys())
+                if isinstance(additional_config, dict)
+                else str(type(additional_config)),
+            )
 
         # Set MoE hyperparameters
         self.num_moe_layers = (
@@ -1590,15 +1591,13 @@ class DeepseekV2ForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        self._trough_call_count += 1
-        B = hidden_states.shape[0]
-
         if not self.enable_trough_decoding:
-            self._last_logits_indices = None
-            self._last_eager_buf = None
-            self._trough_buffers = {}
             return self.logits_processor(self.lm_head, hidden_states)
 
+        from .trough_utils import vectorized_entropy_select
+
+        self._trough_call_count += 1
+        B = hidden_states.shape[0]
         assert isinstance(self.model, DeepseekV2TroughModel)
         layer_states = self._trough_buffers.get(self._last_seq_len, self._last_eager_buf)
         if layer_states is None:
@@ -1611,142 +1610,22 @@ class DeepseekV2ForCausalLM(
         elif B != S_buf:
             layer_states = layer_states[:, -B:]
 
-        selected_logits = self._vectorized_entropy_select(
-            layer_states, hidden_states
+        selected_logits, _, _, _ = vectorized_entropy_select(
+            layer_states=layer_states,
+            fallback_hidden_states=hidden_states,
+            logits_processor=self.logits_processor,
+            lm_head=self.lm_head,
+            select_method=self.trough_select_method,
+            trough_p=self.trough_p,
+            trough_max_backtrack_layers=self.trough_max_backtrack_layers,
+            trough_backtrack_ratio=self.trough_backtrack_ratio,
+            trough_start_layer=self.model._trough_start_layer,
+            total_model_layers=len(self.model.layers),
+            trough_log_interval=self.trough_log_interval,
+            trough_call_count=self._trough_call_count,
         )
         self._last_logits_indices = None
         self._last_seq_len = 0
-        return selected_logits
-
-    def _vectorized_entropy_select(
-        self,
-        layer_states: torch.Tensor,
-        fallback_hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        """Layer selection for entropy-trough (and related) decoding."""
-        import torch.nn.functional as F
-
-        L, B, H = layer_states.shape
-        device = layer_states.device
-
-        flat = layer_states.reshape(L * B, H)
-        flat_logits = self.logits_processor(self.lm_head, flat)
-        if flat_logits is None:
-            return self.logits_processor(self.lm_head, fallback_hidden_states)
-        V = flat_logits.shape[-1]
-        all_logits = flat_logits.reshape(L, B, V)
-
-        method = self.trough_select_method
-
-        assert isinstance(self.model, DeepseekV2TroughModel)
-        total_model_layers = len(self.model.layers)
-        trough_start_layer = self.model._trough_start_layer
-
-        if method.startswith("last-"):
-            try:
-                offset = int(method.split("-m")[-1])
-            except (IndexError, ValueError):
-                offset = 0
-            target_model_layer = max(0, total_model_layers - 1 - offset)
-            cand_idx = target_model_layer - trough_start_layer
-            cand_idx = max(0, min(L - 1, cand_idx))
-            selected_layer_idx = torch.full(
-                (B,), cand_idx, device=device, dtype=torch.long
-            )
-        else:
-            probs = F.softmax(all_logits.float(), dim=-1)
-            entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
-
-            explicit = int(self.trough_max_backtrack_layers)
-            if explicit > 0:
-                max_backtrack = explicit
-            elif explicit < 0:
-                max_backtrack = L
-            else:
-                max_backtrack = int(L * self.trough_backtrack_ratio)
-            min_layer = L - 1 - max(0, max_backtrack)
-
-            selected_layer_idx = torch.full(
-                (B,), L - 1, device=device, dtype=torch.long
-            )
-            frozen = torch.zeros(B, dtype=torch.bool, device=device)
-            prev_entropy = entropy[L - 1]
-
-            for l_idx in range(L - 2, min_layer - 1, -1):
-                cur_entropy = entropy[l_idx]
-                improves = cur_entropy < prev_entropy
-                update_mask = improves & (~frozen)
-                selected_layer_idx = torch.where(
-                    update_mask,
-                    torch.full_like(selected_layer_idx, l_idx),
-                    selected_layer_idx,
-                )
-                frozen = frozen | (~improves)
-                prev_entropy = cur_entropy
-
-            if method == "trough-m2":
-                selected_layer_idx = torch.clamp(selected_layer_idx - 2, 0, L - 1)
-            elif method == "trough-m1":
-                selected_layer_idx = torch.clamp(selected_layer_idx - 1, 0, L - 1)
-            elif method == "trough-p1":
-                selected_layer_idx = torch.clamp(selected_layer_idx + 1, 0, L - 1)
-            elif method == "trough-p2":
-                selected_layer_idx = torch.clamp(selected_layer_idx + 2, 0, L - 1)
-
-        p = float(self.trough_p)
-        if p < 1.0:
-            rng = torch.rand(B, device=device)
-            use_final = rng > p
-            selected_layer_idx = torch.where(
-                use_final,
-                torch.full((B,), L - 1, device=device, dtype=torch.long),
-                selected_layer_idx,
-            )
-
-        gather_idx = selected_layer_idx.unsqueeze(0).unsqueeze(-1).expand(1, B, V)
-        selected_logits = all_logits.gather(0, gather_idx).squeeze(0)
-
-        if B == 0:
-            return selected_logits
-
-        if self.trough_log_interval > 0 and (
-            self._trough_call_count % self.trough_log_interval == 0
-        ):
-            with torch.no_grad():
-                sel = selected_layer_idx
-                backtrack_depth = (L - 1) - sel
-                num_at_final = (sel == (L - 1)).sum().item()
-                preview = min(B, 4)
-                if method.startswith("trough"):
-                    final_entropy = entropy[L - 1]
-                    sample_pairs = [
-                        (int(sel[i].item()), float(final_entropy[i].item()))
-                        for i in range(preview)
-                    ]
-                else:
-                    sample_pairs = [
-                        (int(sel[i].item()), 0.0) for i in range(preview)
-                    ]
-                logger.info(
-                    "[trough-decoding] step=%d tokens=%d layers=%d "
-                    "select_method=%s p=%.2f "
-                    "avg_selected_layer=%.2f min_selected_layer=%d "
-                    "avg_backtrack_depth=%.2f max_backtrack_depth=%d "
-                    "tokens_kept_at_final=%d/%d sample=%s",
-                    self._trough_call_count,
-                    B,
-                    L,
-                    method,
-                    p,
-                    sel.float().mean().item(),
-                    int(sel.min().item()),
-                    backtrack_depth.float().mean().item(),
-                    int(backtrack_depth.max().item()),
-                    num_at_final,
-                    B,
-                    sample_pairs,
-                )
-
         return selected_logits
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

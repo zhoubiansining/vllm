@@ -1421,7 +1421,9 @@ class Qwen2VLForConditionalGeneration(
         if intermediate_tensors is not None:
             inputs_embeds = None
 
-        hidden_states = self.language_model.model(
+        # Call language_model.forward (not language_model.model) so that
+        # feature hooks like trough hidden-state capture are executed.
+        hidden_states = self.language_model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
@@ -1429,10 +1431,21 @@ class Qwen2VLForConditionalGeneration(
         )
         return hidden_states
 
+    @property
+    def enable_trough_decoding(self) -> bool:
+        return getattr(self.language_model, "enable_trough_decoding", False)
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        if getattr(self.language_model, "enable_trough_decoding", False):
+            idx = getattr(self, "_last_logits_indices", None)
+            if idx is not None:
+                self.language_model._last_logits_indices = idx
+            seq_len = getattr(self, "_last_seq_len", None)
+            if seq_len is not None:
+                self.language_model._last_seq_len = seq_len
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
