@@ -1494,8 +1494,17 @@ class DeepseekV2ForCausalLM(
         self.trough_log_interval = int(_cfg_get("trough_log_interval", 0))
         self._trough_call_count = 0
         self._trough_buffers = {}
-        self._last_eager_buf = None
         self._last_seq_len = 0
+
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+        cg_sizes = (
+            getattr(compilation_config, "cudagraph_capture_sizes", None)
+            if compilation_config is not None
+            else None
+        )
+        self._trough_captured_shapes: frozenset[int] = (
+            frozenset(cg_sizes) if cg_sizes else frozenset()
+        )
 
         if self.enable_trough_decoding:
             logger.info(
@@ -1583,8 +1592,8 @@ class DeepseekV2ForCausalLM(
         for hs in trough_states:
             normed = self.model.norm(hs, None)
             normed_layers.append(normed)
-        self._last_eager_buf = torch.stack(normed_layers) if normed_layers else None
-        self._trough_buffers[hidden_states.shape[0]] = self._last_eager_buf
+        normed_buf = torch.stack(normed_layers) if normed_layers else None
+        self._trough_buffers[hidden_states.shape[0]] = normed_buf
         return hidden_states
 
     def compute_logits(
@@ -1599,7 +1608,7 @@ class DeepseekV2ForCausalLM(
         self._trough_call_count += 1
         B = hidden_states.shape[0]
         assert isinstance(self.model, DeepseekV2TroughModel)
-        layer_states = self._trough_buffers.get(self._last_seq_len, self._last_eager_buf)
+        layer_states = self._trough_buffers.get(self._last_seq_len)
         if layer_states is None:
             return self.logits_processor(self.lm_head, hidden_states)
         L_buf, S_buf, H_buf = layer_states.shape
@@ -1624,9 +1633,20 @@ class DeepseekV2ForCausalLM(
             trough_log_interval=self.trough_log_interval,
             trough_call_count=self._trough_call_count,
         )
+        if (
+            self._last_seq_len not in self._trough_captured_shapes
+            and self._last_seq_len in self._trough_buffers
+        ):
+            self._trough_buffers.pop(self._last_seq_len, None)
         self._last_logits_indices = None
         self._last_seq_len = 0
         return selected_logits
+
+    def clear_trough_buffers(self) -> None:
+        captured = self._trough_captured_shapes
+        for key in list(self._trough_buffers.keys()):
+            if key not in captured:
+                self._trough_buffers.pop(key, None)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

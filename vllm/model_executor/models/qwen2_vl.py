@@ -1435,6 +1435,11 @@ class Qwen2VLForConditionalGeneration(
     def enable_trough_decoding(self) -> bool:
         return getattr(self.language_model, "enable_trough_decoding", False)
 
+    def clear_trough_buffers(self) -> None:
+        clear = getattr(self.language_model, "clear_trough_buffers", None)
+        if clear is not None:
+            clear()
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,

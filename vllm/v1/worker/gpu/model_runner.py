@@ -578,6 +578,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+
+        # Drop warmup-only trough decoding buffers whose shapes are NOT
+        # captured by CUDA graphs. Captured shapes stay resident — popping
+        # them would invalidate addresses baked into the graph.
+        if getattr(self.model, "enable_trough_decoding", False):
+            clear_fn = getattr(self.model, "clear_trough_buffers", None)
+            if clear_fn is not None:
+                clear_fn()
+
         # This usually takes 5~20 seconds.
         logger.info(
             "Graph capturing finished in %.0f secs, took %.2f GiB",

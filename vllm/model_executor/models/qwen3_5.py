@@ -671,8 +671,22 @@ class Qwen3_5ForCausalLMBase(
         self._trough_call_count = 0
 
         self._trough_buffers = {}
-        self._last_eager_buf = None
         self._last_seq_len = 0
+
+        # Shapes that CUDA graph captures will reuse on replay. These buffers
+        # MUST stay resident — popping them would invalidate the captured
+        # tensor addresses and crash on replay. Eager-only shapes
+        # (e.g. chunked-prefill batches that miss the captured set) are popped
+        # in compute_logits to bound memory growth.
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+        cg_sizes = (
+            getattr(compilation_config, "cudagraph_capture_sizes", None)
+            if compilation_config is not None
+            else None
+        )
+        self._trough_captured_shapes: frozenset[int] = (
+            frozenset(cg_sizes) if cg_sizes else frozenset()
+        )
 
         if self.enable_trough_decoding:
             logger.info(
@@ -738,10 +752,13 @@ class Qwen3_5ForCausalLMBase(
             for hs in trough_states:
                 normed = self.model.norm(hs, None)
                 normed_layers.append(normed)
-            self._last_eager_buf = (
+            normed_buf = (
                 torch.stack(normed_layers) if normed_layers else None
             )
-            self._trough_buffers[hidden_states.shape[0]] = self._last_eager_buf
+            # Store unconditionally so CUDA graph capture sees the same tensor
+            # address on capture and replay. Eager-only shapes are evicted in
+            # compute_logits once the buffer is consumed.
+            self._trough_buffers[hidden_states.shape[0]] = normed_buf
 
             if aux_hidden_states:
                 return hidden_states, aux_hidden_states
@@ -760,7 +777,7 @@ class Qwen3_5ForCausalLMBase(
         self._trough_call_count += 1
         B = hidden_states.shape[0]
         assert isinstance(self.model, Qwen3_5TroughModel)
-        layer_states = self._trough_buffers.get(self._last_seq_len, self._last_eager_buf)
+        layer_states = self._trough_buffers.get(self._last_seq_len)
         if layer_states is None:
             return self.logits_processor(self.lm_head, hidden_states)
         L_buf, S_buf, H_buf = layer_states.shape
@@ -785,9 +802,30 @@ class Qwen3_5ForCausalLMBase(
             trough_log_interval=self.trough_log_interval,
             trough_call_count=self._trough_call_count,
         )
+        # Evict eager-only buffers (shapes the CUDA graph never captures).
+        # Captured shapes MUST stay resident — popping them invalidates the
+        # tensor address baked into the graph and crashes on next replay.
+        if (
+            self._last_seq_len not in self._trough_captured_shapes
+            and self._last_seq_len in self._trough_buffers
+        ):
+            self._trough_buffers.pop(self._last_seq_len, None)
         self._last_logits_indices = None
         self._last_seq_len = 0
         return selected_logits
+
+    def clear_trough_buffers(self) -> None:
+        """Remove all non-graph-captured buffers after CUDA graph capture.
+
+        Called by the model runner after capture_model() to evict warmup
+        artefacts for shapes that are not in cudagraph_capture_sizes.
+        Graph-captured shapes are preserved — they are still referenced
+        by the runner via _last_seq_len on each replay step.
+        """
+        captured = self._trough_captured_shapes
+        for key in list(self._trough_buffers.keys()):
+            if key not in captured:
+                self._trough_buffers.pop(key, None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
@@ -953,6 +991,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
     @property
     def enable_trough_decoding(self) -> bool:
         return getattr(self.language_model, "enable_trough_decoding", False)
+
+    def clear_trough_buffers(self) -> None:
+        clear = getattr(self.language_model, "clear_trough_buffers", None)
+        if clear is not None:
+            clear()
 
     def compute_logits(
         self,
