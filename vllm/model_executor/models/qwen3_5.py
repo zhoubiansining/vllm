@@ -772,47 +772,9 @@ class Qwen3_5ForCausalLMBase(
         if not self.enable_trough_decoding:
             return self.logits_processor(self.lm_head, hidden_states)
 
-        from .trough_utils import vectorized_entropy_select
+        from .trough_utils import compute_confident_decoding_logits
 
-        self._trough_call_count += 1
-        B = hidden_states.shape[0]
-        assert isinstance(self.model, Qwen3_5TroughModel)
-        layer_states = self._trough_buffers.get(self._last_seq_len)
-        if layer_states is None:
-            return self.logits_processor(self.lm_head, hidden_states)
-        L_buf, S_buf, H_buf = layer_states.shape
-
-        logits_indices = getattr(self, "_last_logits_indices", None)
-        if logits_indices is not None:
-            layer_states = layer_states[:, logits_indices]
-        elif B != S_buf:
-            layer_states = layer_states[:, -B:]
-
-        selected_logits, _, _, _ = vectorized_entropy_select(
-            layer_states=layer_states,
-            fallback_hidden_states=hidden_states,
-            logits_processor=self.logits_processor,
-            lm_head=self.lm_head,
-            select_method=self.trough_select_method,
-            trough_p=self.trough_p,
-            trough_max_backtrack_layers=self.trough_max_backtrack_layers,
-            trough_backtrack_ratio=self.trough_backtrack_ratio,
-            trough_start_layer=self.model._trough_start_layer,
-            total_model_layers=len(self.model.layers),
-            trough_log_interval=self.trough_log_interval,
-            trough_call_count=self._trough_call_count,
-        )
-        # Evict eager-only buffers (shapes the CUDA graph never captures).
-        # Captured shapes MUST stay resident — popping them invalidates the
-        # tensor address baked into the graph and crashes on next replay.
-        if (
-            self._last_seq_len not in self._trough_captured_shapes
-            and self._last_seq_len in self._trough_buffers
-        ):
-            self._trough_buffers.pop(self._last_seq_len, None)
-        self._last_logits_indices = None
-        self._last_seq_len = 0
-        return selected_logits
+        return compute_confident_decoding_logits(self, hidden_states)
 
     def clear_trough_buffers(self) -> None:
         """Remove all non-graph-captured buffers after CUDA graph capture.

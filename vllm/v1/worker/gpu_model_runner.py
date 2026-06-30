@@ -5090,7 +5090,12 @@ class GPUModelRunner(
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
             if getattr(actual_model, "enable_trough_decoding", False):
                 actual_model._last_seq_len = hidden_states.shape[0]
-                actual_model._last_logits_indices = None
+                actual_model._last_logits_indices = torch.arange(
+                    offset,
+                    offset + num_logits,
+                    device=hidden_states.device,
+                    dtype=torch.int64,
+                )
             logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,

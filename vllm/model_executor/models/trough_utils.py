@@ -7,7 +7,7 @@ Provides:
 - ``read_trough_config``: read trough parameters from vllm_config.
 - ``compute_trough_layer_range``: compute candidate layer range for a model.
 - ``TroughStateMixin``: base mixin adding trough-related state and methods.
-- ``vectorized_entropy_select``: in-place entropy computation + layer selection.
+- ``vectorized_entropy_select``: memory-efficient entropy-trough layer selection.
 """
 
 import math
@@ -110,6 +110,112 @@ class TroughStateMixin:
         raise NotImplementedError
 
 
+def clear_trough_step_state(model) -> None:
+    """Reset per-step trough metadata after compute_logits."""
+    model._last_logits_indices = None
+    model._last_seq_len = 0
+
+
+def prepare_trough_layer_states(
+    *,
+    trough_buffers: dict[int, torch.Tensor],
+    last_seq_len: int,
+    last_logits_indices: torch.Tensor | None,
+    sample_batch_size: int,
+) -> tuple[torch.Tensor | None, str | None]:
+    """Resolve ``[L, B, H]`` layer states aligned with the sample batch.
+
+    Returns ``(layer_states, skip_reason)``. When ``skip_reason`` is set,
+    callers must fall back to final-layer logits instead of trough selection.
+    """
+    if last_seq_len <= 0:
+        return None, "invalid_last_seq_len"
+
+    layer_states = trough_buffers.get(last_seq_len)
+    if layer_states is None:
+        return None, "buffer_miss"
+
+    _, S_buf, _ = layer_states.shape
+    B = sample_batch_size
+
+    if last_logits_indices is not None:
+        if last_logits_indices.numel() != B:
+            return None, "indices_count_mismatch"
+        if last_logits_indices.numel() == 0:
+            return None, "empty_indices"
+        max_idx = int(last_logits_indices.max().item())
+        min_idx = int(last_logits_indices.min().item())
+        if min_idx < 0 or max_idx >= S_buf:
+            return None, "indices_out_of_range"
+        return layer_states[:, last_logits_indices], None
+
+    if B == S_buf:
+        return layer_states, None
+
+    # Do not guess with ``[:, -B:]`` — that misaligns prompt-logprobs and
+    # padded batches when sample rows are not the trailing S_buf positions.
+    return None, "missing_logits_indices"
+
+
+def finalize_trough_step_buffers(model) -> None:
+    """Drop eager trough buffers and clear step metadata."""
+    seq_len = model._last_seq_len
+    captured = model._trough_captured_shapes
+    if seq_len not in captured and seq_len in model._trough_buffers:
+        model._trough_buffers.pop(seq_len, None)
+    clear_trough_step_state(model)
+
+
+def _resolve_lm_head(model):
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is not None:
+        return lm_head
+    return model.model.embed_tokens
+
+
+def compute_confident_decoding_logits(
+    model,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor | None:
+    """Shared Confident Decoding logits path for CausalLM wrappers."""
+    lm_head = _resolve_lm_head(model)
+    model._trough_call_count += 1
+    B = hidden_states.shape[0]
+
+    layer_states, fallback_reason = prepare_trough_layer_states(
+        trough_buffers=model._trough_buffers,
+        last_seq_len=model._last_seq_len,
+        last_logits_indices=getattr(model, "_last_logits_indices", None),
+        sample_batch_size=B,
+    )
+    if layer_states is None:
+        if fallback_reason not in (None, "buffer_miss"):
+            logger.debug(
+                "Confident Decoding fallback (%s): using final-layer logits",
+                fallback_reason,
+            )
+        clear_trough_step_state(model)
+        return model.logits_processor(lm_head, hidden_states)
+
+    inner = model.model
+    selected_logits, _, _, _ = vectorized_entropy_select(
+        layer_states=layer_states,
+        fallback_hidden_states=hidden_states,
+        logits_processor=model.logits_processor,
+        lm_head=lm_head,
+        select_method=model.trough_select_method,
+        trough_p=model.trough_p,
+        trough_max_backtrack_layers=model.trough_max_backtrack_layers,
+        trough_backtrack_ratio=model.trough_backtrack_ratio,
+        trough_start_layer=inner._trough_start_layer,
+        total_model_layers=len(inner.layers),
+        trough_log_interval=model.trough_log_interval,
+        trough_call_count=model._trough_call_count,
+    )
+    finalize_trough_step_buffers(model)
+    return selected_logits
+
+
 def vectorized_entropy_select(
     layer_states: torch.Tensor,
     fallback_hidden_states: torch.Tensor,
@@ -126,9 +232,14 @@ def vectorized_entropy_select(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Compute entropy trough layer selection.
 
-    Operates **in-place** on ``layer_states`` logits to save memory:
-    logits -> probs (in-place softmax), entropy computed in-place,
-    logits rebuilt in-place before gather.
+    Memory strategy (no extra ``[L, B, V]`` softmax buffer):
+
+    1. Stable softmax **in-place** on ``all_logits`` (only ``row_max`` / ``Z``
+       scalars per row are kept).
+    2. Entropy per layer via ``torch.special.entr`` on ``[B, V]`` slices so
+       peak temp is one layer, not ``L × B × V``.
+    3. Rebuild raw logits in-place with ``log(p) + log(Z) + max`` before
+       ``gather`` — never ``exp(probs)`` and never ``(p * p.log_())``.
 
     Args:
         layer_states: ``[L, B, H]`` normed hidden states per candidate layer.
@@ -148,8 +259,6 @@ def vectorized_entropy_select(
         Tuple of (selected_logits ``[B, V]``, entropy ``[L, B]``,
         layer_states ``[L, B, V]``, L).
     """
-    import torch.nn.functional as F
-
     L, B, H = layer_states.shape
     device = layer_states.device
 
@@ -178,14 +287,18 @@ def vectorized_entropy_select(
         )
         entropy = torch.zeros(L, B, device=device)
     else:
-        # In-place softmax on logits to save memory.
+        # In-place stable softmax; keep row_max and log(Z) for logits rebuild.
         row_max = all_logits.max(dim=-1, keepdim=True).values
         all_logits.sub_(row_max)
         all_logits.exp_()
         Z = all_logits.sum(dim=-1, keepdim=True)
         all_logits.div_(Z)
-        entropy = (all_logits * all_logits.log_()).sum(dim=-1)
-        entropy.neg_()
+        log_Z = Z.log()
+
+        # Layer-wise entropy: peak temp is [B, V], not [L, B, V].
+        entropy = torch.empty(L, B, device=device, dtype=all_logits.dtype)
+        for l_idx in range(L):
+            entropy[l_idx] = torch.special.entr(all_logits[l_idx]).sum(dim=-1)
 
         explicit = int(trough_max_backtrack_layers)
         if explicit > 0:
@@ -194,7 +307,10 @@ def vectorized_entropy_select(
             max_backtrack = L
         else:
             max_backtrack = int(L * trough_backtrack_ratio)
-        min_layer = L - 1 - max(0, max_backtrack)
+        # Cap backtrack to L-1 so the loop never uses negative layer indices
+        # (e.g. max_backtrack=10, L=10 previously yielded min_layer=-1).
+        max_backtrack = min(max_backtrack, max(L - 1, 0))
+        min_layer = max(0, L - 1 - max_backtrack)
 
         selected_layer_idx = torch.full(
             (B,), L - 1, device=device, dtype=torch.long
@@ -214,10 +330,9 @@ def vectorized_entropy_select(
             frozen = frozen | (~improves)
             prev_entropy = cur_entropy
 
-        # Rebuild raw logits for gather (in-place).
-        all_logits.exp_()
-        all_logits.mul_(Z)
+        # Rebuild logits: log(p) + log(Z) + max = raw logits (probs in buffer).
         all_logits.log_()
+        all_logits.add_(log_Z)
         all_logits.add_(row_max)
 
         if method == "trough-m2":
